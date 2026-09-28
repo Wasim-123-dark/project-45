@@ -1,0 +1,500 @@
+/*
+  ROVER PILOT - ESP32 BLE HUMAN-FOLLOWING TROLLEY
+  ------------------------------------------------
+  Browser commands:
+    M = Manual mode
+    A = Automatic follow mode
+    F = Forward
+    B = Backward
+    L = Left
+    R = Right
+    S = Stop
+
+  BLE device name: ESP32_TROLLEY
+
+  Important:
+  The ultrasonic sensor measures distance to the nearest object.
+  It cannot identify whether the object is a person, chair, or wall.
+  For real person-only detection, add a camera, mmWave radar, or
+  another human-detection sensor.
+*/
+
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <ctype.h>
+
+// =====================================================
+// BLE UUIDs - these match the Rover Pilot website
+// =====================================================
+#define SERVICE_UUID        "0000ffe0-0000-1000-8000-00805f9b34fb"
+#define CHARACTERISTIC_UUID "0000ffe1-0000-1000-8000-00805f9b34fb"
+
+// =====================================================
+// L298N MOTOR DRIVER
+// =====================================================
+#define ENA 25
+#define IN1 26
+#define IN2 27
+
+#define IN3 14
+#define IN4 32
+#define ENB 33
+
+// =====================================================
+// ULTRASONIC SENSOR
+// =====================================================
+#define TRIG_PIN 4
+#define ECHO_PIN 34
+
+// =====================================================
+// SERVO
+// =====================================================
+#define SERVO_PIN 5
+
+// =====================================================
+// LED AND BUZZER
+// =====================================================
+#define LED_PIN 19
+#define BUZZER_PIN 18
+
+// =====================================================
+// SETTINGS
+// =====================================================
+int motorSpeed = 80;
+
+// Manual command timing, in milliseconds
+int forwardTime = 400;
+int backwardTime = 400;
+int turnTime = 300;
+
+// Automatic follow thresholds, in centimeters
+int tooClose = 25;
+int followDistance = 100;
+int scanDistance = 150;
+
+// =====================================================
+// GLOBAL STATE
+// =====================================================
+BLECharacteristic *commandCharacteristic = nullptr;
+BLEServer *bleServer = nullptr;
+Servo myServo;
+
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+bool autoMode = false;
+bool commandReceived = false;
+char pendingCommand = 'S';
+
+unsigned long lastAutoCheck = 0;
+unsigned long lastStatusSent = 0;
+const unsigned long autoCheckInterval = 180;
+const unsigned long statusInterval = 700;
+
+// Forward declarations used by BLE callbacks
+void stopMotors();
+void sendStatus(const String &message);
+
+// =====================================================
+// SEND STATUS TO BROWSER
+// =====================================================
+void sendStatus(const String &message) {
+  Serial.println(message);
+
+  if (deviceConnected && commandCharacteristic != nullptr) {
+    commandCharacteristic->setValue(message.c_str());
+    commandCharacteristic->notify();
+  }
+}
+
+// =====================================================
+// BLE SERVER CALLBACKS
+// =====================================================
+class RoverServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *server) override {
+    deviceConnected = true;
+    sendStatus("CONNECTED");
+    Serial.println("Browser connected over BLE");
+  }
+
+  void onDisconnect(BLEServer *server) override {
+    deviceConnected = false;
+    stopMotors();
+    autoMode = false;
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("Browser disconnected - motors stopped");
+  }
+};
+
+class RoverCommandCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *characteristic) override {
+    String value = characteristic->getValue().c_str();
+
+    if (value.length() == 0) {
+      return;
+    }
+
+    char command = toupper(value.charAt(0));
+
+    if (command == '\n' || command == '\r' || command == ' ') {
+      return;
+    }
+
+    pendingCommand = command;
+    commandReceived = true;
+
+    Serial.print("BLE command received: ");
+    Serial.println(command);
+  }
+};
+
+// =====================================================
+// MOTOR FUNCTIONS
+// =====================================================
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+void forward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+}
+
+void backward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+}
+
+void leftTurn() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+}
+
+void rightTurn() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, motorSpeed);
+  analogWrite(ENB, motorSpeed);
+}
+
+void manualForward() {
+  sendStatus("FORWARD");
+  forward();
+  delay(forwardTime);
+  stopMotors();
+}
+
+void manualBackward() {
+  sendStatus("BACKWARD");
+  backward();
+  delay(backwardTime);
+  stopMotors();
+}
+
+void manualLeft() {
+  sendStatus("LEFT");
+  leftTurn();
+  delay(turnTime);
+  stopMotors();
+}
+
+void manualRight() {
+  sendStatus("RIGHT");
+  rightTurn();
+  delay(turnTime);
+  stopMotors();
+}
+
+// =====================================================
+// ULTRASONIC DISTANCE
+// =====================================================
+int getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    return 999;
+  }
+
+  int distance = (int)(duration * 0.0343 / 2.0);
+
+  if (distance < 2 || distance > 400) {
+    return 999;
+  }
+
+  return distance;
+}
+
+// =====================================================
+// BUZZER
+// =====================================================
+void beep() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(80);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// =====================================================
+// MANUAL BLE COMMAND HANDLING
+// =====================================================
+void handleCommand(char command) {
+  command = toupper(command);
+
+  if (command == 'M') {
+    autoMode = false;
+    stopMotors();
+    myServo.write(90);
+    digitalWrite(LED_PIN, LOW);
+    sendStatus("Manualmode ON");
+    return;
+  }
+
+  if (command == 'A') {
+    autoMode = true;
+    stopMotors();
+    myServo.write(90);
+    sendStatus("Automatic ON");
+    return;
+  }
+
+  if (command == 'S') {
+    stopMotors();
+    sendStatus("STOP");
+    return;
+  }
+
+  // Direction commands work only in manual mode
+  if (!autoMode) {
+    if (command == 'F') {
+      manualForward();
+    } else if (command == 'B') {
+      manualBackward();
+    } else if (command == 'L') {
+      manualLeft();
+    } else if (command == 'R') {
+      manualRight();
+    } else {
+      sendStatus("UNKNOWN COMMAND");
+    }
+  } else {
+    sendStatus("AUTO MODE ACTIVE");
+  }
+}
+
+// =====================================================
+// AUTOMATIC FOLLOW MODE
+// =====================================================
+void automaticFollow() {
+  int centerDistance = getDistance();
+
+  Serial.print("Distance: ");
+  Serial.print(centerDistance);
+  Serial.println(" cm");
+
+  // Too close: stop for safety
+  if (centerDistance < tooClose) {
+    stopMotors();
+    digitalWrite(LED_PIN, HIGH);
+    sendStatus("TOO CLOSE");
+    beep();
+    return;
+  }
+
+  // Object/person is in follow range
+  if (centerDistance >= tooClose && centerDistance <= followDistance) {
+    digitalWrite(LED_PIN, LOW);
+    forward();
+
+    if (millis() - lastStatusSent > statusInterval) {
+      sendStatus("Human Found");
+      String distanceMessage = "DISTANCE:" + String(centerDistance);
+      sendStatus(distanceMessage);
+      lastStatusSent = millis();
+    }
+
+    delay(100);
+    stopMotors();
+    return;
+  }
+
+  // Far object: scan left and right
+  if (centerDistance > followDistance && centerDistance <= scanDistance) {
+    stopMotors();
+    digitalWrite(LED_PIN, LOW);
+
+    myServo.write(130);
+    delay(300);
+    int leftDistance = getDistance();
+
+    myServo.write(50);
+    delay(300);
+    int rightDistance = getDistance();
+
+    myServo.write(90);
+    delay(100);
+
+    if (leftDistance < scanDistance && leftDistance > rightDistance) {
+      leftTurn();
+      delay(turnTime);
+      stopMotors();
+      sendStatus("SCANNING LEFT");
+    } else if (rightDistance < scanDistance && rightDistance > leftDistance) {
+      rightTurn();
+      delay(turnTime);
+      stopMotors();
+      sendStatus("SCANNING RIGHT");
+    } else {
+      sendStatus("Not Found");
+    }
+
+    return;
+  }
+
+  // No object in usable range
+  stopMotors();
+  digitalWrite(LED_PIN, LOW);
+
+  if (millis() - lastStatusSent > statusInterval) {
+    sendStatus("Not Found");
+    String distanceMessage = "DISTANCE:" + String(centerDistance);
+    sendStatus(distanceMessage);
+    lastStatusSent = millis();
+  }
+}
+
+// =====================================================
+// BLE SETUP
+// =====================================================
+void setupBLE() {
+  BLEDevice::init("ESP32_TROLLEY");
+
+  bleServer = BLEDevice::createServer();
+  bleServer->setCallbacks(new RoverServerCallbacks());
+
+  BLEService *service = bleServer->createService(SERVICE_UUID);
+
+  commandCharacteristic = service->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_WRITE_NR |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+
+  commandCharacteristic->addDescriptor(new BLE2902());
+  commandCharacteristic->setCallbacks(new RoverCommandCallbacks());
+  commandCharacteristic->setValue("ESP32_TROLLEY_READY");
+
+  service->start();
+
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->setMinPreferred(0x06);
+  advertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.println("BLE advertising started");
+  Serial.println("Device name: ESP32_TROLLEY");
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  myServo.setPeriodHertz(50);
+  myServo.attach(SERVO_PIN, 500, 2400);
+  myServo.write(90);
+
+  stopMotors();
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  setupBLE();
+
+  Serial.println();
+  Serial.println("====================================");
+  Serial.println("ESP32 BLE HUMAN-FOLLOWING TROLLEY");
+  Serial.println("====================================");
+  Serial.println("M Manual | A Automatic | F Forward");
+  Serial.println("B Backward | L Left | R Right | S Stop");
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+void loop() {
+  // Process the latest browser command
+  if (commandReceived) {
+    commandReceived = false;
+    handleCommand(pendingCommand);
+  }
+
+  // Run automatic mode at a controlled interval
+  if (autoMode && millis() - lastAutoCheck >= autoCheckInterval) {
+    lastAutoCheck = millis();
+    automaticFollow();
+  }
+
+  // Restart advertising after a browser disconnects
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500);
+    bleServer->startAdvertising();
+    Serial.println("Advertising restarted");
+    oldDeviceConnected = deviceConnected;
+  }
+
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+
+  delay(10);
+}
